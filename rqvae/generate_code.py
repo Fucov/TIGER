@@ -18,7 +18,7 @@ import os
 def check_collision(all_indices_str):
     tot_item = len(all_indices_str)
     tot_indice = len(set(all_indices_str.tolist()))
-    return tot_item==tot_indice
+    return tot_item == tot_indice
 
 def get_indices_count(all_indices_str):
     indices_count = collections.defaultdict(int)
@@ -48,7 +48,8 @@ ckpt_path = f"./ckpt/{dataset}/Jun-17-2025_15-21-52/best_collision_model.pth"
 output_file = f"../data/{dataset}/{dataset}_t5_rqvae.npy"
 device = torch.device("cuda:0")
 
-ckpt = torch.load(ckpt_path, map_location=torch.device('cpu'))
+# ckpt = torch.load(ckpt_path, map_location=torch.device('cpu'))
+ckpt = torch.load(ckpt_path, map_location=torch.device('cpu'), weights_only=False)
 args = ckpt["args"]
 state_dict = ckpt["state_dict"]
 
@@ -56,35 +57,35 @@ state_dict = ckpt["state_dict"]
 data = EmbDataset(args.data_path)
 
 model = RQVAE(in_dim=data.dim,
-                  num_emb_list=args.num_emb_list,
-                  e_dim=args.e_dim,
-                  layers=args.layers,
-                  dropout_prob=args.dropout_prob,
-                  bn=args.bn,
-                  loss_type=args.loss_type,
-                  quant_loss_weight=args.quant_loss_weight,
-                  kmeans_init=args.kmeans_init,
-                  kmeans_iters=args.kmeans_iters,
-                  sk_epsilons=args.sk_epsilons,
-                  sk_iters=args.sk_iters,
-                  )
+              num_emb_list=args.num_emb_list,
+              e_dim=args.e_dim,
+              layers=args.layers,
+              dropout_prob=args.dropout_prob,
+              bn=args.bn,
+              loss_type=args.loss_type,
+              quant_loss_weight=args.quant_loss_weight,
+              kmeans_init=args.kmeans_init,
+              kmeans_iters=args.kmeans_iters,
+              sk_epsilons=args.sk_epsilons,
+              sk_iters=args.sk_iters,
+              )
 
 model.load_state_dict(state_dict)
 model = model.to(device)
 model.eval()
 print(model)
 
-data_loader = DataLoader(data,num_workers=args.num_workers,
-                             batch_size=64, shuffle=False,
-                             pin_memory=True)
+data_loader = DataLoader(data, num_workers=args.num_workers,
+                         batch_size=64, shuffle=False,
+                         pin_memory=True)
 
 all_indices = []
 all_indices_str = []
-prefix = ["<a_{}>","<b_{}>","<c_{}>","<d_{}>","<e_{}>"]
+prefix = ["<a_{}>", "<b_{}>", "<c_{}>", "<d_{}>", "<e_{}>"]
 
 for d in tqdm(data_loader):
     d = d.to(device)
-    indices = model.get_indices(d,use_sk=False)
+    indices = model.get_indices(d, use_sk=False)
     indices = indices.view(-1, indices.shape[-1]).cpu().numpy()
     for index in indices:
         code = []
@@ -99,10 +100,10 @@ all_indices = np.array(all_indices)
 all_indices_str = np.array(all_indices_str)
 
 for vq in model.rq.vq_layers[:-1]:
-    vq.sk_epsilon=0.0
+    vq.sk_epsilon = 0.0
 
 tt = 0
-#There are often duplicate items in the dataset, and we no longer differentiate them
+# There are often duplicate items in the dataset, and we no longer differentiate them
 while True:
     if tt >= 30 or check_collision(all_indices_str):
         break
@@ -130,7 +131,7 @@ print("Max number of conflicts: ", max(get_indices_count(all_indices_str).values
 
 tot_item = len(all_indices_str)
 tot_indice = len(set(all_indices_str.tolist()))
-print("Collision Rate",(tot_item-tot_indice)/tot_item)
+print("Collision Rate", (tot_item - tot_indice) / tot_item)
 
 
 all_indices_dict = {}
