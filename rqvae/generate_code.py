@@ -1,30 +1,29 @@
 import collections
-import json
 import logging
+import os
 
 import numpy as np
 import torch
-from time import time
-from torch import optim
 from tqdm import tqdm
-
 from torch.utils.data import DataLoader
 
 from datasets import EmbDataset
 from models.rqvae import RQVAE
+from utils import ensure_dir, get_local_time
 
-import os
 
 def check_collision(all_indices_str):
     tot_item = len(all_indices_str)
     tot_indice = len(set(all_indices_str.tolist()))
     return tot_item == tot_indice
 
+
 def get_indices_count(all_indices_str):
     indices_count = collections.defaultdict(int)
     for index in all_indices_str:
         indices_count[index] += 1
     return indices_count
+
 
 def get_collision_item(all_indices_str):
     index2id = {}
@@ -41,6 +40,7 @@ def get_collision_item(all_indices_str):
 
     return collision_item_groups
 
+
 # Attention: Remember to change the dataset name and checkpoint path
 # if you want to generate codes for other datasets.
 dataset = "Beauty"
@@ -48,36 +48,53 @@ ckpt_path = f"./ckpt/{dataset}/Jun-17-2025_15-21-52/best_collision_model.pth"
 output_file = f"../data/{dataset}/{dataset}_t5_rqvae.npy"
 device = torch.device("cuda:0")
 
+# --- 日志配置 ---
+
+log_dir = "./logs"
+ensure_dir(log_dir)
+_log_file = os.path.join(log_dir, f"generate_{get_local_time()}.log")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[
+        logging.FileHandler(_log_file, encoding="utf-8"),
+        logging.StreamHandler(),
+    ],
+)
+logging.info(f"Log file: {_log_file}")
+logging.info(f"Dataset: {dataset}, ckpt: {ckpt_path}")
+
 # ckpt = torch.load(ckpt_path, map_location=torch.device('cpu'))
-ckpt = torch.load(ckpt_path, map_location=torch.device('cpu'), weights_only=False)
+ckpt = torch.load(ckpt_path, map_location=torch.device("cpu"), weights_only=False)
 args = ckpt["args"]
 state_dict = ckpt["state_dict"]
 
 
 data = EmbDataset(args.data_path)
 
-model = RQVAE(in_dim=data.dim,
-              num_emb_list=args.num_emb_list,
-              e_dim=args.e_dim,
-              layers=args.layers,
-              dropout_prob=args.dropout_prob,
-              bn=args.bn,
-              loss_type=args.loss_type,
-              quant_loss_weight=args.quant_loss_weight,
-              kmeans_init=args.kmeans_init,
-              kmeans_iters=args.kmeans_iters,
-              sk_epsilons=args.sk_epsilons,
-              sk_iters=args.sk_iters,
-              )
+model = RQVAE(
+    in_dim=data.dim,
+    num_emb_list=args.num_emb_list,
+    e_dim=args.e_dim,
+    layers=args.layers,
+    dropout_prob=args.dropout_prob,
+    bn=args.bn,
+    loss_type=args.loss_type,
+    quant_loss_weight=args.quant_loss_weight,
+    kmeans_init=args.kmeans_init,
+    kmeans_iters=args.kmeans_iters,
+    sk_epsilons=args.sk_epsilons,
+    sk_iters=args.sk_iters,
+)
 
 model.load_state_dict(state_dict)
 model = model.to(device)
 model.eval()
 print(model)
 
-data_loader = DataLoader(data, num_workers=args.num_workers,
-                         batch_size=64, shuffle=False,
-                         pin_memory=True)
+data_loader = DataLoader(
+    data, num_workers=args.num_workers, batch_size=64, shuffle=False, pin_memory=True
+)
 
 all_indices = []
 all_indices_str = []
@@ -126,25 +143,29 @@ while True:
     tt += 1
 
 
-print("All indices number: ",len(all_indices))
+print("All indices number: ", len(all_indices))
 print("Max number of conflicts: ", max(get_indices_count(all_indices_str).values()))
 
 tot_item = len(all_indices_str)
 tot_indice = len(set(all_indices_str.tolist()))
-print("Collision Rate", (tot_item - tot_indice) / tot_item)
+collision_rate = (tot_item - tot_indice) / tot_item
+print("Collision Rate", collision_rate)
+logging.info(
+    f"All indices: {tot_item}, Unique: {tot_indice}, Collision Rate: {collision_rate:.6f}"
+)
 
 
 all_indices_dict = {}
 for item, indices in enumerate(all_indices.tolist()):
     all_indices_dict[item] = list(indices)
 
-    
+
 # initialize a list to store the converted codes
 codes = []
 
 # iterate through the dictionary and convert each list of indices to a code
 for key, value in all_indices_dict.items():
-    code = [int(item.split('_')[1].strip('>')) for item in value]
+    code = [int(item.split("_")[1].strip(">")) for item in value]
     codes.append(code)
 
 # convert the list of codes to a numpy array
@@ -162,7 +183,9 @@ if len(duplicates) > 0:
     for duplicate in duplicates:
         duplicate_indices = np.where((codes_array == duplicate).all(axis=1))[0]
         for i, idx in enumerate(duplicate_indices):
-            codes_array[idx, -1] = i  # Increment the last digit for resolving duplicates
+            codes_array[idx, -1] = (
+                i  # Increment the last digit for resolving duplicates
+            )
 
 new_unique_codes, new_counts = np.unique(codes_array, axis=0, return_counts=True)
 duplicates = new_unique_codes[new_counts > 1]
@@ -176,4 +199,4 @@ else:
 print(f"Saving codes to {output_file}")
 print(f"the first 5 codes: {codes_array[:5]}")
 np.save(output_file, codes_array)
-
+logging.info(f"Saved codes to {output_file}, shape: {codes_array.shape}")

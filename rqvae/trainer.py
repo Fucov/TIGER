@@ -5,14 +5,18 @@ import torch
 from time import time
 from torch import optim
 from tqdm import tqdm
-from transformers import get_linear_schedule_with_warmup, get_constant_schedule_with_warmup
+from transformers import (
+    get_linear_schedule_with_warmup,
+    get_constant_schedule_with_warmup,
+)
 
-from utils import ensure_dir,set_color,get_local_time,delete_file
+from utils import ensure_dir, set_color, get_local_time, delete_file
 import os
 
 import heapq
-class Trainer(object):
 
+
+class Trainer(object):
     def __init__(self, args, model, data_num):
         self.args = args
         self.model = model
@@ -35,7 +39,7 @@ class Trainer(object):
         self.device = torch.device(self.device)
         self.ckpt_dir = args.ckpt_dir
         saved_model_dir = "{}".format(get_local_time())
-        self.ckpt_dir = os.path.join(self.ckpt_dir,saved_model_dir)
+        self.ckpt_dir = os.path.join(self.ckpt_dir, saved_model_dir)
         ensure_dir(self.ckpt_dir)
 
         self.best_loss = np.inf
@@ -46,10 +50,14 @@ class Trainer(object):
         self.scheduler = self._get_scheduler()
         self.model = self.model.to(self.device)
 
+        # 对比学习超参数（cl_weight=0 时自动跳过，向后兼容）
+        self.cl_weight = getattr(args, "cl_weight", 0.0)
+        self.temperature = getattr(args, "temperature", 0.07)
+
     def _build_optimizer(self):
 
         params = self.model.parameters()
-        learner =  self.learner
+        learner = self.learner
         learning_rate = self.lr
         weight_decay = self.weight_decay
 
@@ -69,10 +77,8 @@ class Trainer(object):
             optimizer = optim.RMSprop(
                 params, lr=learning_rate, weight_decay=weight_decay
             )
-        elif learner.lower() == 'adamw':
-            optimizer = optim.AdamW(
-                params, lr=learning_rate, weight_decay=weight_decay
-            )
+        elif learner.lower() == "adamw":
+            optimizer = optim.AdamW(params, lr=learning_rate, weight_decay=weight_decay)
         else:
             self.logger.warning(
                 "Received unrecognized optimizer, set default Adam optimizer"
@@ -82,18 +88,21 @@ class Trainer(object):
 
     def _get_scheduler(self):
         if self.lr_scheduler_type.lower() == "linear":
-            lr_scheduler = get_linear_schedule_with_warmup(optimizer=self.optimizer,
-                                                           num_warmup_steps=self.warmup_steps,
-                                                           num_training_steps=self.max_steps)
+            lr_scheduler = get_linear_schedule_with_warmup(
+                optimizer=self.optimizer,
+                num_warmup_steps=self.warmup_steps,
+                num_training_steps=self.max_steps,
+            )
         else:
-            lr_scheduler = get_constant_schedule_with_warmup(optimizer=self.optimizer,
-                                                             num_warmup_steps=self.warmup_steps)
+            lr_scheduler = get_constant_schedule_with_warmup(
+                optimizer=self.optimizer, num_warmup_steps=self.warmup_steps
+            )
 
         return lr_scheduler
+
     def _check_nan(self, loss):
         if torch.isnan(loss):
             raise ValueError("Training loss is nan")
-
 
     def _train_epoch(self, train_data, epoch_idx):
 
@@ -101,40 +110,47 @@ class Trainer(object):
 
         total_loss = 0
         total_recon_loss = 0
+        total_cl_loss = 0
         iter_data = tqdm(
-                    train_data,
-                    total=len(train_data),
-                    ncols=100,
-                    desc=set_color(f"Train {epoch_idx}","pink"),
-                    )
+            train_data,
+            total=len(train_data),
+            ncols=100,
+            desc=set_color(f"Train {epoch_idx}", "pink"),
+        )
 
         for batch_idx, data in enumerate(iter_data):
             data = data.to(self.device)
             self.optimizer.zero_grad()
-            out, rq_loss, indices = self.model(data)
+            out, rq_loss, indices, z, z_q = self.model(data)
             loss, loss_recon = self.model.compute_loss(out, rq_loss, xs=data)
+
+            # InfoNCE 对比学习（cl_weight=0 时跳过）
+            if self.cl_weight > 0:
+                loss_cl = self.model.cl_loss(z, z_q, temperature=self.temperature)
+                loss = loss + self.cl_weight * loss_cl
+                total_cl_loss += loss_cl.item()
+
             self._check_nan(loss)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
             self.optimizer.step()
             self.scheduler.step()
-            # print(self.scheduler.get_last_lr())
             total_loss += loss.item()
             total_recon_loss += loss_recon.item()
 
-        return total_loss, total_recon_loss
+        return total_loss, total_recon_loss, total_cl_loss
 
     @torch.no_grad()
     def _valid_epoch(self, valid_data):
 
         self.model.eval()
 
-        iter_data =tqdm(
-                valid_data,
-                total=len(valid_data),
-                ncols=100,
-                desc=set_color(f"Evaluate   ", "pink"),
-            )
+        iter_data = tqdm(
+            valid_data,
+            total=len(valid_data),
+            ncols=100,
+            desc=set_color(f"Evaluate   ", "pink"),
+        )
 
         indices_set = set()
         num_sample = 0
@@ -142,19 +158,25 @@ class Trainer(object):
             num_sample += len(data)
             data = data.to(self.device)
             indices = self.model.get_indices(data)
-            indices = indices.view(-1,indices.shape[-1]).cpu().numpy()
+            indices = indices.view(-1, indices.shape[-1]).cpu().numpy()
             for index in indices:
                 code = "-".join([str(int(_)) for _ in index])
                 indices_set.add(code)
 
-        collision_rate = (num_sample - len(list(indices_set)))/num_sample
+        collision_rate = (num_sample - len(list(indices_set))) / num_sample
 
         return collision_rate
 
     def _save_checkpoint(self, epoch, collision_rate=1, ckpt_file=None):
 
-        ckpt_path = os.path.join(self.ckpt_dir,ckpt_file) if ckpt_file \
-            else os.path.join(self.ckpt_dir, 'epoch_%d_collision_%.4f_model.pth' % (epoch, collision_rate))
+        ckpt_path = (
+            os.path.join(self.ckpt_dir, ckpt_file)
+            if ckpt_file
+            else os.path.join(
+                self.ckpt_dir,
+                "epoch_%d_collision_%.4f_model.pth" % (epoch, collision_rate),
+            )
+        )
         state = {
             "args": self.args,
             "epoch": epoch,
@@ -165,13 +187,13 @@ class Trainer(object):
         }
         torch.save(state, ckpt_path, pickle_protocol=4)
 
-        self.logger.info(
-            set_color("Saving current", "blue") + f": {ckpt_path}"
-        )
+        self.logger.info(set_color("Saving current", "blue") + f": {ckpt_path}")
 
         return ckpt_path
 
-    def _generate_train_loss_output(self, epoch_idx, s_time, e_time, loss, recon_loss):
+    def _generate_train_loss_output(
+        self, epoch_idx, s_time, e_time, loss, recon_loss, cl_loss=0.0
+    ):
         train_loss_output = (
             set_color("epoch %d training", "green")
             + " ["
@@ -179,10 +201,14 @@ class Trainer(object):
             + ": %.2fs, "
         ) % (epoch_idx, e_time - s_time)
         train_loss_output += set_color("train loss", "blue") + ": %.4f" % loss
-        train_loss_output +=", "
-        train_loss_output += set_color("reconstruction loss", "blue") + ": %.4f" % recon_loss
+        train_loss_output += ", "
+        train_loss_output += (
+            set_color("reconstruction loss", "blue") + ": %.4f" % recon_loss
+        )
+        if self.cl_weight > 0:
+            train_loss_output += ", "
+            train_loss_output += set_color("cl loss", "blue") + ": %.4f" % cl_loss
         return train_loss_output + "]"
-
 
     def fit(self, data):
 
@@ -191,13 +217,19 @@ class Trainer(object):
         for epoch_idx in range(self.epochs):
             # train
             training_start_time = time()
-            train_loss, train_recon_loss = self._train_epoch(data, epoch_idx)
+            train_loss, train_recon_loss, train_cl_loss = self._train_epoch(
+                data, epoch_idx
+            )
             training_end_time = time()
             train_loss_output = self._generate_train_loss_output(
-                epoch_idx, training_start_time, training_end_time, train_loss, train_recon_loss
+                epoch_idx,
+                training_start_time,
+                training_end_time,
+                train_loss,
+                train_recon_loss,
+                cl_loss=train_cl_loss / max(len(data), 1),
             )
             self.logger.info(train_loss_output)
-
 
             # eval
             if (epoch_idx + 1) % self.eval_step == 0:
@@ -206,16 +238,20 @@ class Trainer(object):
 
                 if train_loss < self.best_loss:
                     self.best_loss = train_loss
-                    self._save_checkpoint(epoch=epoch_idx, ckpt_file=self.best_loss_ckpt)
+                    self._save_checkpoint(
+                        epoch=epoch_idx, ckpt_file=self.best_loss_ckpt
+                    )
 
                 if collision_rate < self.best_collision_rate:
                     self.best_collision_rate = collision_rate
                     cur_eval_step = 0
-                    self._save_checkpoint(epoch_idx, collision_rate=collision_rate,
-                                          ckpt_file=self.best_collision_ckpt)
+                    self._save_checkpoint(
+                        epoch_idx,
+                        collision_rate=collision_rate,
+                        ckpt_file=self.best_collision_ckpt,
+                    )
                 else:
                     cur_eval_step += 1
-
 
                 valid_end_time = time()
                 valid_score_output = (
@@ -228,7 +264,9 @@ class Trainer(object):
                 ) % (epoch_idx, valid_end_time - valid_start_time, collision_rate)
 
                 self.logger.info(valid_score_output)
-                ckpt_path = self._save_checkpoint(epoch_idx, collision_rate=collision_rate)
+                ckpt_path = self._save_checkpoint(
+                    epoch_idx, collision_rate=collision_rate
+                )
                 now_save = (-collision_rate, ckpt_path)
                 if len(self.newest_save_queue) < self.save_limit:
                     self.newest_save_queue.append(now_save)
@@ -246,10 +284,4 @@ class Trainer(object):
                     if old_save not in self.best_save_heap:
                         delete_file(old_save[1])
 
-
-
         return self.best_loss, self.best_collision_rate
-
-
-
-
