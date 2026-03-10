@@ -5,7 +5,7 @@
 ## 🚀 项目亮点
 
 * **性能突破**：Beauty 数据集 Recall@10 达 **0.0772**，超越原项目基准约 **30%**。
-* **InfoNCE 对比学习（新增）**：通过拉近同一物品连续编码与量化编码的距离，提升语义 ID 区分度，有效降低码碰撞率。
+* **类目感知对比学习 SCL（新增）**：在 RQ-VAE 阶段引入 Category-aware Supervised Contrastive Learning，同类目物品不参与负样本排斥，保护语义 ID 的层次前缀共享结构。
 * **完整文件日志**：三个训练阶段均写入带时间戳的 `.log` 文件，方便实验追踪。
 * **冷启动接口（新增）**：新物品无需重训 RQ-VAE，通过 `project_new_item()` 直接推理分配语义 ID。
 * **现代环境栈**：基于 Python 3.11 + PyTorch 2.1.2，适配 WSL2 深度学习流。
@@ -42,15 +42,17 @@ pip install -r requirements.txt
 ├── data/
 │   ├── reviews_Beauty_5.json.gz    # 必须放在此处
 │   ├── meta_Beauty.json.gz         # 必须放在此处
+│   ├── add_category.py             # 类目提取脚本（追加 category_id 到 parquet）
 │   └── Beauty/
-│       ├── item_emb.parquet        # Sentence-T5 语义向量
+│       ├── item_emb.parquet        # Sentence-T5 语义向量 + category_id
+│       ├── category_mapping.npy    # 类目名称 → 整数 ID 映射
 │       ├── item_mapping.npy        # ID 映射表
 │       ├── train/valid/test.parquet
 │       └── Beauty_t5_rqvae.npy    # 最终语义 ID 码表（4 层级）
 ├── sentence-t5-base/               # 本地权重（ModelScope 下载）
 ├── rqvae/                          # 阶段一：语义 ID 构建
 │   ├── models/
-│   │   ├── rqvae.py               # RQ-VAE + InfoNCE 对比学习
+│   │   ├── rqvae.py               # RQ-VAE + Category-aware SCL 对比学习
 │   │   ├── rq.py                  # 残差向量量化器
 │   │   ├── vq.py                  # 单层向量量化器
 │   │   └── layers.py              # MLP、K-Means、Sinkhorn
@@ -79,6 +81,15 @@ jupyter notebook data/process.ipynb
 
 脚本读取 `data/*.gz`，完成数据清洗、Sentence-T5 特征提取，输出 `item_emb.parquet`。
 
+**追加类目信息**（仅首次需要）：
+
+```bash
+cd data
+python add_category.py
+```
+
+脚本自动从 `meta_Beauty.json.gz` 提取二级类目，给 `item_emb.parquet` 追加 `category_id` 列。
+
 ---
 
 ### 阶段 1：训练 RQ-VAE（构建语义 ID）
@@ -95,8 +106,8 @@ python main.py
 | `--epochs` | 3000 | 训练轮数 |
 | `--batch_size` | 1024 | 批大小 |
 | `--num_emb_list` | 256 256 256 | 各层码本大小 |
-| `--cl_weight` | **0.1** | InfoNCE 对比学习权重（0 = 禁用）|
-| `--temperature` | **0.07** | InfoNCE 温度系数 |
+| `--cl_weight` | **0.1** | Category-aware SCL 权重（0 = 禁用）|
+| `--temperature` | **0.07** | SCL 温度系数 |
 | `--log_dir` | ./logs | 日志输出目录 |
 
 日志自动写入 `rqvae/logs/rqvae_<timestamp>.log`。
@@ -157,13 +168,21 @@ python main.py
 
 ## 🔬 改进设计
 
-### InfoNCE 对比学习
+### Category-aware Supervised Contrastive Learning (SCL)
 
-在 RQ-VAE 训练阶段引入对比损失，正样本对为同一物品的连续编码 $z$ 与量化编码 $z_q$：
+标准 InfoNCE 将 batch 内所有其他物品视为负样本，会破坏同类目物品共享语义 ID 前缀的层次结构。
 
-$$\mathcal{L}_{CL} = -\log\frac{\exp(\text{sim}(z_i, z_{q,i})/\tau)}{\sum_{j=1}^{N}\exp(\text{sim}(z_i, z_{q,j})/\tau)}$$
+**本项目改进**：引入类目 Mask 矩阵，同类目物品不参与负样本排斥：
 
-通过 `--cl_weight` 控制叠加权重（设为 0 可完全禁用，向后兼容）。
+$$\mathcal{L}_{SCL} = -\frac{1}{N}\sum_{i=1}^{N}\log\frac{\exp(\text{sim}(z_i, z_{q,i})/\tau)}{\exp(\text{sim}(z_i, z_{q,i})/\tau) + \sum_{j \neq i} M_{ij} \cdot \exp(\text{sim}(z_i, z_{q,j})/\tau)}$$
+
+其中 $M_{ij} = 1$ 当 $\text{Category}(i) \neq \text{Category}(j)$，否则为 $0$。
+
+**实现特点**：
+- 纯矩阵运算（`torch.eq` + `logical_not`），无 for 循环
+- 自动退化：无 `category_id` 列时等价于标准 InfoNCE
+- 边界保护：全同类目 batch 时分母 `logsumexp` 自然退化为正样本项，loss = 0
+- 通过 `--cl_weight` 控制叠加权重（设为 0 可完全禁用）
 
 ### 冷启动接口
 

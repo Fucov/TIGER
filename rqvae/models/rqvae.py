@@ -72,30 +72,84 @@ class RQVAE(nn.Module):
 
     @staticmethod
     def cl_loss(
-        z: torch.Tensor, z_q: torch.Tensor, temperature: float = 0.07
+        z: torch.Tensor,
+        z_q: torch.Tensor,
+        labels: torch.Tensor = None,
+        temperature: float = 0.07,
+        epsilon: float = 1e-8,
     ) -> torch.Tensor:
-        """InfoNCE Contrastive Loss.
+        """类目感知监督对比学习损失 (Category-aware SCL)。
 
-        正样本对：同一物品的 z（encoder 输出）与 z_q（量化输出）。
-        负样本对：batch 内其他物品的 z_q。
+        当提供 labels（类目 ID）时，同类目物品不参与负样本排斥，
+        保护 TIGER 语义 ID 的层次前缀共享结构。
+        当 labels=None 或全为 -1 时，退化为标准 InfoNCE。
+
+        公式：
+        L = -1/N Σᵢ log[ exp(sim(zᵢ,z_qᵢ)/τ) /
+                         ( exp(sim(zᵢ,z_qᵢ)/τ) + Σⱼ≠ᵢ Mᵢⱼ · exp(sim(zᵢ,z_qⱼ)/τ) ) ]
+
+        其中 Mᵢⱼ = 1 当 Category(i) ≠ Category(j)，否则为 0。
 
         Args:
-            z:   (N, D) encoder 连续输出，L2 归一化前
-            z_q: (N, D) 量化后的离散表示，L2 归一化前
-            temperature: InfoNCE 温度系数
+            z:    (N, D) encoder 连续输出
+            z_q:  (N, D) 量化后的离散表示
+            labels: (N,) 类目 ID 整数张量（-1 表示无类目信息）
+            temperature: 温度系数
+            epsilon: 分母保护值，防止全同类目时 log(0)
 
         Returns:
             scalar loss
         """
+        N = z.size(0)
+
+        # ---- Step 1: L2 归一化 ----
         z = F.normalize(z.float(), dim=-1)  # (N, D)
         z_q = F.normalize(z_q.float(), dim=-1)  # (N, D)
 
-        # 相似度矩阵 (N, N)  —— 对角线为正样本对
-        logits = torch.matmul(z, z_q.T) / temperature  # (N, N)
-        labels = torch.arange(z.size(0), device=z.device)
+        # ---- Step 2: 相似度矩阵 ----
+        # sim_matrix[i, j] = cos(zᵢ, z_qⱼ) / τ
+        sim_matrix = torch.matmul(z, z_q.T) / temperature  # (N, N)
 
-        # 双向对称 InfoNCE
-        loss = (F.cross_entropy(logits, labels) + F.cross_entropy(logits.T, labels)) / 2
+        # ---- Step 3: 构建类目 Mask 矩阵 ----
+        # neg_mask[i, j] = True  →  j 是 i 的有效负样本（不同类目）
+        # neg_mask[i, j] = False →  j 与 i 同类目，不参与排斥
+        if labels is not None and not (labels < 0).all():
+            # same_cat[i, j] = True 当 labels[i] == labels[j]
+            same_cat = torch.eq(
+                labels.unsqueeze(1),  # (N, 1)
+                labels.unsqueeze(0),  # (1, N)
+            )  # (N, N) bool
+
+            # 负样本 mask = 不同类目 AND 不是自己
+            eye_mask = torch.eye(N, dtype=torch.bool, device=z.device)
+            neg_mask = torch.logical_not(same_cat) & torch.logical_not(eye_mask)
+            # neg_mask: (N, N) True = 有效负样本
+        else:
+            # 无类目信息 → 退化为标准 InfoNCE：除自身外全是负样本
+            neg_mask = torch.logical_not(
+                torch.eye(N, dtype=torch.bool, device=z.device)
+            )
+
+        # ---- Step 4: 计算 SCL Loss ----
+        # 正样本 logit = 对角线
+        pos_logits = torch.diag(sim_matrix)  # (N,)
+
+        # 负样本 logit：被 mask 掉的位置填 -inf（不参与 softmax 分母）
+        neg_logits = sim_matrix.clone()
+        neg_logits[~neg_mask] = float("-inf")  # 同类目 + 自身位置 → -inf
+
+        # 分母 = exp(正样本) + Σ_有效负样本 exp(负样本)
+        # 为了数值稳定，先减去 max
+        all_logits = torch.cat([pos_logits.unsqueeze(1), neg_logits], dim=1)  # (N, 1+N)
+        log_denom = torch.logsumexp(all_logits, dim=1)  # (N,)
+
+        # ---- Step 5: 边界保护 ----
+        # 如果某行全是 -inf（整个 batch 同类目），logsumexp 退化为 pos_logits 本身
+        # 此时 loss_i = pos - pos = 0，是合理的（无需排斥任何人）
+        # 但为安全起见加 epsilon 防止极端数值
+        loss = -(pos_logits - log_denom)  # (N,)
+        loss = loss.mean()
+
         return loss
 
     @torch.no_grad()

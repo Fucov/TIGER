@@ -118,15 +118,24 @@ class Trainer(object):
             desc=set_color(f"Train {epoch_idx}", "pink"),
         )
 
-        for batch_idx, data in enumerate(iter_data):
+        for batch_idx, batch in enumerate(iter_data):
+            # EmbDataset 返回 (embedding, category_id) 元组
+            data, cat_ids = batch
             data = data.to(self.device)
+            cat_ids = cat_ids.to(self.device)
+
             self.optimizer.zero_grad()
             out, rq_loss, indices, z, z_q = self.model(data)
             loss, loss_recon = self.model.compute_loss(out, rq_loss, xs=data)
 
-            # InfoNCE 对比学习（cl_weight=0 时跳过）
+            # Category-aware SCL（cl_weight=0 时跳过）
             if self.cl_weight > 0:
-                loss_cl = self.model.cl_loss(z, z_q, temperature=self.temperature)
+                loss_cl = self.model.cl_loss(
+                    z,
+                    z_q,
+                    labels=cat_ids,
+                    temperature=self.temperature,
+                )
                 loss = loss + self.cl_weight * loss_cl
                 total_cl_loss += loss_cl.item()
 
@@ -149,12 +158,14 @@ class Trainer(object):
             valid_data,
             total=len(valid_data),
             ncols=100,
-            desc=set_color(f"Evaluate   ", "pink"),
+            desc=set_color("Evaluate   ", "pink"),
         )
 
         indices_set = set()
         num_sample = 0
-        for batch_idx, data in enumerate(iter_data):
+        for batch_idx, batch in enumerate(iter_data):
+            # EmbDataset 返回 (embedding, category_id)，验证时忽略 cat_id
+            data, _ = batch
             num_sample += len(data)
             data = data.to(self.device)
             indices = self.model.get_indices(data)
